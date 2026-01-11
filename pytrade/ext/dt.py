@@ -17,7 +17,7 @@ HOLIDAYS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
 __UA__ = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/141.0.0.0 Safari/537.36"
+    "Chrome/143.0.0.0 Safari/537.36"
 )
 
 
@@ -65,14 +65,16 @@ def is_workday(date: dt.date) -> bool:
     本地缓存整体为一个 JSON 文件，按年份组织，如无则请求 API 自动保存。
     """
 
+    year = str(date.year)
+    date_str = date.strftime("%m%d")
+    
     if HOLIDAYS_CACHE_PATH.exists():
         with open(HOLIDAYS_CACHE_PATH, "r", encoding="utf-8") as f:
             all_trading_days = json.load(f)
+            if year not in all_trading_days:
+                all_trading_days = asyncio.run(fetch_all_holiday_days())
     else:
         all_trading_days = asyncio.run(fetch_all_holiday_days())
-
-    year = str(date.year)
-    date_str = date.strftime("%m%d")
     return date_str in set(all_trading_days.get(year, []))
 
 
