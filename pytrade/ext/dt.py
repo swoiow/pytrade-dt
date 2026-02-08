@@ -4,7 +4,6 @@ import json
 import os
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from typing import Optional, Union
 
 import pandas as pd
 import requests
@@ -60,16 +59,15 @@ async def fetch_all_holiday_days(start_year: int = 1990, end_year: int = dt.date
 
 
 def is_workday(date: dt.date) -> bool:
-    """
-    判断指定日期是否是中国交易日。
+    """判断指定日期是否是中国交易日。
     本地缓存整体为一个 JSON 文件，按年份组织，如无则请求 API 自动保存。
     """
 
     year = str(date.year)
     date_str = date.strftime("%m%d")
-    
+
     if HOLIDAYS_CACHE_PATH.exists():
-        with open(HOLIDAYS_CACHE_PATH, "r", encoding="utf-8") as f:
+        with open(HOLIDAYS_CACHE_PATH, encoding="utf-8") as f:
             all_trading_days = json.load(f)
             if year not in all_trading_days:
                 all_trading_days = asyncio.run(fetch_all_holiday_days())
@@ -78,8 +76,8 @@ def is_workday(date: dt.date) -> bool:
     return date_str in set(all_trading_days.get(year, []))
 
 
-def get_latest_cn_trading_day(base_datetime: Optional[Union[dt.datetime, dt.date]] = None) -> dt.date:
-    """ 获取中国最新的交易日。
+def get_latest_cn_trading_day(base_datetime: dt.datetime | dt.date | None = None) -> dt.date:
+    """获取中国最新的交易日。
 
     规则说明：
     1. 节假日,周末（周六或周日）,非节假日+工作日+当前时间在早上9点前，回退前一天，循环到不用回退。
@@ -263,9 +261,8 @@ def load_special_events():
     }
 
 
-def mark_special_events(date: "dt.date") -> Optional[str]:
-    """
-    根据日期标记特殊金融或社会事件。
+def mark_special_events(date: "dt.date") -> str | None:
+    """根据日期标记特殊金融或社会事件。
 
     参数:
         date: 要判断的日期 (datetime.date)
@@ -273,7 +270,6 @@ def mark_special_events(date: "dt.date") -> Optional[str]:
     返回:
         如果是特殊事件日，返回事件名；否则返回 None。
     """
-
     special_events = load_special_events()
     for event_name, (start_date, end_date) in special_events.items():
         if start_date <= date <= end_date:
