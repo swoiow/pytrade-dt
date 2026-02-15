@@ -1,7 +1,10 @@
 import asyncio
 import datetime as dt
 import json
+import mmap
 import os
+import struct
+from bisect import bisect_left, bisect_right
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -9,71 +12,152 @@ import pandas as pd
 import requests
 
 
-USER_HOME = Path(os.environ.get("HOME") or os.environ.get("USERPROFILE") or Path.home())
-HOLIDAYS_CACHE_PATH = USER_HOME / "pytrade" / "holiday_days.json"
-HOLIDAYS_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+# --- 全局配置 ---
+USER_HOME = Path(r"C:\ProgramData" if os.name == "nt" else (os.environ.get("HOME") or Path.home()))
+CACHE_DIR = USER_HOME / "pytrade"
+HOLIDAYS_JSON_PATH = CACHE_DIR / "holiday_days.json"
+HOLIDAYS_BIN_PATH = CACHE_DIR / "holiday_days.bin"
+CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 __UA__ = (
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) "
-    "Chrome/143.0.0.0 Safari/537.36"
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_7_2 like Mac OS X) "
+    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+    "Mobile/15E148 hxFont/normal getHXAPPAdaptOldSetting/0 "
+    "Language/zh-Hans getHXAPPAccessibilityMode/0 hxnoimage/0 "
+    "getHXAPPFontSetting/normal VASdkVersion/1.2.2 "
+    "VoiceAssistantVer/0 hxtheme/0 IHexin/11.93.00 (Royal Flush) "
+    "innerversion/I037.08.566 build/11.93.00 surveyVer/0 isVip/1"
 )
 
+# 全局变量：存储内存映射对象与文件句柄
+_MMAP_OBJ: mmap.mmap | None = None
+_MMAP_FD: int | None = None
 
-def _fetch_holiday_days_sync(year: int):
+
+# --- 内部工具 ---
+
+def _close_mmap():
+    global _MMAP_OBJ, _MMAP_FD
+    if _MMAP_OBJ:
+        _MMAP_OBJ.close()
+    if _MMAP_FD:
+        try:
+            os.close(_MMAP_FD)
+        except:
+            pass
+    _MMAP_OBJ, _MMAP_FD = None, None
+
+
+def _load_mmap():
+    global _MMAP_OBJ, _MMAP_FD
+    _close_mmap()
+    if not HOLIDAYS_BIN_PATH.exists():
+        return
+    # 检查文件大小，避免映射空文件
+    if HOLIDAYS_BIN_PATH.stat().st_size == 0:
+        return
+    _MMAP_FD = os.open(HOLIDAYS_BIN_PATH, os.O_RDONLY)
+    _MMAP_OBJ = mmap.mmap(_MMAP_FD, 0, access=mmap.ACCESS_READ)
+
+
+class MmapCalendarProxy:
+    __slots__ = ("mm",)
+
+    def __init__(self, mm: mmap.mmap): self.mm = mm
+
+    def __len__(self): return len(self.mm) // 4
+
+    def __getitem__(self, index):
+        return struct.unpack(">I", self.mm[index * 4: index * 4 + 4])[0]
+
+
+# --- 数据获取与同步 ---
+
+def _fetch_holiday_days_sync(year: int) -> dict:
     url = f"https://vaserviece.10jqka.com.cn/mobilecfxf/data/json_{year}.txt"
     try:
         resp = requests.get(url, timeout=10, headers={"User-Agent": __UA__})
         resp.raise_for_status()
-        data = resp.json()
         print(f"[{year}] 成功")
-        return {str(year): data}
+        return {str(year): resp.json()}
     except Exception as e:
         print(f"[{year}] 失败: {e}")
         return {}
 
 
-async def fetch_all_holiday_days(start_year: int = 1990, end_year: int = dt.date.today().year):
-    all_holiday_days = {}
+async def update_calendar_cache(start_year: int, end_year: int):
+    """专门负责网络拉取和更新文件，不涉及 is_workday 逻辑"""
+    all_data = {}
+    if HOLIDAYS_JSON_PATH.exists():
+        with open(HOLIDAYS_JSON_PATH, "r", encoding="utf-8") as f:
+            all_data = json.load(f)
 
     loop = asyncio.get_running_loop()
-    years_to_fetch = [year for year in range(start_year, end_year + 1) if str(year) not in all_holiday_days]
+    years = [y for y in range(start_year, end_year + 1) if str(y) not in all_data]
 
-    async def fetch_with_executor(year: int):
-        return await loop.run_in_executor(executor, _fetch_holiday_days_sync, year)
+    if years:
+        with ThreadPoolExecutor(max_workers=3) as executor:
+            tasks = [loop.run_in_executor(executor, _fetch_holiday_days_sync, y) for y in years]
+            for res in await asyncio.gather(*tasks):
+                all_data.update(res)
 
-    results = []
-    # 限制最大并发线程数为 3
-    with ThreadPoolExecutor(max_workers=3) as executor:
-        tasks = [fetch_with_executor(year) for year in years_to_fetch]
-        results = await asyncio.gather(*tasks)
+        if not all_data:
+            raise RuntimeWarning("no calendar data")
 
-    for result in results:
-        all_holiday_days.update(result)
+        # 写入 JSON
+        with open(HOLIDAYS_JSON_PATH, "w", encoding="utf-8") as f:
+            json.dump(all_data, f, ensure_ascii=False, indent=2)
 
-    with open(HOLIDAYS_CACHE_PATH, "w", encoding="utf-8") as f:
-        json.dump(all_holiday_days, f, ensure_ascii=False, indent=2)
-        print(f"[OK] 所有交易日数据已保存: {HOLIDAYS_CACHE_PATH}")
+        # 写入 BIN (确保有序)
+        date_ints = sorted([int(f"{yr}{d}") for yr, days in all_data.items() for d in days])
+        with open(HOLIDAYS_BIN_PATH, "wb") as f:
+            for val in date_ints:
+                f.write(struct.pack(">I", val))
 
-    return all_holiday_days
+    _load_mmap()
 
+
+def _ensure_data(target_year: int):
+    """只做检查和按需触发更新，不再调用 is_workday"""
+    global _MMAP_OBJ
+    if _MMAP_OBJ is None:
+        if not HOLIDAYS_BIN_PATH.exists():
+            asyncio.run(update_calendar_cache(1990, dt.date.today().year))
+        else:
+            _load_mmap()
+
+    # 检查年份覆盖
+    if _MMAP_OBJ:
+        proxy = MmapCalendarProxy(_MMAP_OBJ)
+        y_min, y_max = proxy[0] // 10000, proxy[len(proxy) - 1] // 10000
+        if not (y_min <= target_year <= y_max):
+            asyncio.run(update_calendar_cache(min(y_min, target_year), max(y_max, target_year)))
+
+
+# --- 公开接口 ---
 
 def is_workday(date: dt.date) -> bool:
-    """判断指定日期是否是中国交易日。
-    本地缓存整体为一个 JSON 文件，按年份组织，如无则请求 API 自动保存。
-    """
+    _ensure_data(date.year)
+    if not _MMAP_OBJ: return False
+    target = int(date.strftime("%Y%m%d"))
+    proxy = MmapCalendarProxy(_MMAP_OBJ)
+    idx = bisect_left(proxy, target)
+    return idx < len(proxy) and proxy[idx] == target
 
-    year = str(date.year)
-    date_str = date.strftime("%m%d")
 
-    if HOLIDAYS_CACHE_PATH.exists():
-        with open(HOLIDAYS_CACHE_PATH, encoding="utf-8") as f:
-            all_trading_days = json.load(f)
-            if year not in all_trading_days:
-                all_trading_days = asyncio.run(fetch_all_holiday_days())
-    else:
-        all_trading_days = asyncio.run(fetch_all_holiday_days())
-    return date_str in set(all_trading_days.get(year, []))
+def get_recent_n_trading_days(n: int, end_date: dt.date | None = None) -> list[dt.date]:
+    if n <= 0: return []
+    ref_date = end_date or dt.date.today()
+    _ensure_data(ref_date.year)
+    if not _MMAP_OBJ: return []
+
+    target_int = int(ref_date.strftime("%Y%m%d"))
+    proxy = MmapCalendarProxy(_MMAP_OBJ)
+    idx = bisect_right(proxy, target_int)
+    start_idx = max(0, idx - n)
+
+    return [dt.date(v // 10000, (v // 100) % 100, v % 100)
+            for v in (proxy[j] for j in range(idx - 1, start_idx - 1, -1))]
 
 
 def get_latest_cn_trading_day(base_datetime: dt.datetime | dt.date | None = None) -> dt.date:
@@ -302,3 +386,4 @@ def mark_special_events_faster(trade_dates: "pd.Series") -> "pd.Series":
 
 if __name__ == '__main__':
     print(get_latest_cn_trading_day())
+    print(get_recent_n_trading_days(22))

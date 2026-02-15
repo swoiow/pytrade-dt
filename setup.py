@@ -1,3 +1,4 @@
+import datetime as dt
 import re
 from pathlib import Path
 
@@ -15,7 +16,7 @@ def read_version() -> str:
     Complies with PEP 440 and handles development/post-release tags.
     """
 
-    default_ver = "0.0.1.dev0"
+    default_ver = dt.datetime.now().strftime("%Y.%m.%d.%H%M%S")
     if not VERSION_FILE.exists():
         return default_ver
 
